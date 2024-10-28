@@ -128,11 +128,12 @@ def block_softmax(batch_size, attn, block_mapping, block_scales, block_groups):
     attn = normalize(batch_size=batch_size, attn=attn, block_mapping=block_mapping, block_scales=block_scales, block_groups=block_groups)
     attn = attn.exp_()
     sums = attn.sum(dim=-1).unsqueeze(-1)
-    block_sum = sums
-    sums = block2batch(sums, block_mapping)
-    sums = batch2block(sums, block_mapping)
-    sums.add_(torch.finfo(sums.dtype).tiny)
-    sums = torch.maximum(block_sum, sums)
+    # block_sum = sums
+    # sums = block2batch(sums, block_mapping)
+    # sums = batch2block(sums, block_mapping)
+    # #sums.add_(torch.finfo(sums.dtype).tiny)
+    # sums = sums.add(torch.finfo(sums.dtype).tiny)
+    # sums = torch.maximum(block_sum, sums)
     attn.div_(sums)
     return attn
 
