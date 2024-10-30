@@ -30,6 +30,20 @@ except ImportError:
     logger.warning("Could not import HPU FusedSDPA kernel. "
                    "vLLM will use native implementation.")
 
+def constant_attn_max(attn_max_list):
+    # TODO: use statistic value
+    # attn_max = torch.concat(attn_max_list, dim=-1)
+    # attn_max = attn_max.amax(dim=-1, keepdim=True)
+    # attn_max = torch.zeros_like(attn_max).copy_(attn_max)
+    attn_max = attn_max_list[-1]
+    print(attn_max)
+    return attn_max
+
+def apply_constant(attn, block_mapping):
+    if isinstance(attn, float):
+        return attn
+    # only works on wsum
+    return batch2block(attn, block_mapping).unsqueeze(-1)
 
 class SoftmaxNormalization:
 
@@ -41,6 +55,7 @@ class SoftmaxNormalization:
             'wsum_head_amax': self.wsum_head_amax,
             'index_reduce': self.index_reduce,
             'scatter_reduce': self.scatter_reduce,
+            'constant': self.constant,
         }
         supported_impls = implementations.keys()
         for impl in selected_impl:
@@ -48,8 +63,12 @@ class SoftmaxNormalization:
         self.selected_impl = [implementations[impl] for impl in selected_impl]
 
     def __call__(self, attn, **kwargs):
+        batch_attn = None
         for impl in self.selected_impl:
-            attn = impl(attn, **kwargs)
+            attn = impl(attn, batch_attn=batch_attn, **kwargs)
+            if isinstance(attn, tuple):
+                batch_attn = attn[1]
+                attn = attn[0]
         return attn
 
     @staticmethod
@@ -57,14 +76,23 @@ class SoftmaxNormalization:
         """Normalize by global maximum values"""
         dims = tuple(range(1, attn.dim()))
         attn_max = attn.amax(dims).amax()
-        return attn.sub_(attn_max)
+        return attn_max
+
+    @staticmethod
+    def constant(attn, batch_attn, attn_max, **rest):
+        last_item = attn if batch_attn == None else batch_attn
+        x_fix = torch.zeros_like(last_item)
+        last_item = torch.where( (torch.isnan(last_item)) | torch.isinf(last_item), last_item, x_fix) 
+        attn_max[-1] = torch.zeros_like(last_item).copy_(last_item)
+        attn_max.append(constant_attn_max(attn_max))
+        return attn
 
     @staticmethod
     def head_amax(attn, **rest):
         """Normalize by head maximum values"""
         dims = (0, attn.dim() - 1)
         attn_max = attn.amax(dims, keepdim=True)
-        return attn.sub_(attn_max)
+        return attn_max
 
     @staticmethod
     def wsum(attn, block_mapping, block_scales, **rest):
@@ -72,9 +100,9 @@ class SoftmaxNormalization:
         block_sum_attn = attn.amax(-1)
         missing_dims = block_sum_attn.dim() - block_scales.dim()
         block_sum_attn.mul_(block_scales.reshape(-1, *[1 for _ in range(missing_dims)]))
-        block_sum_attn = block2batch(block_sum_attn, block_mapping)
-        block_sum_attn = batch2block(block_sum_attn, block_mapping)
-        return attn.sub_(block_sum_attn.unsqueeze(-1))
+        batch_sum_attn = block2batch(block_sum_attn, block_mapping)
+        block_sum_attn = batch2block(batch_sum_attn, block_mapping)
+        return block_sum_attn.unsqueeze(-1), batch_sum_attn
 
     @staticmethod
     def wsum_head_amax(attn, block_mapping, block_scales, **rest):
@@ -87,7 +115,7 @@ class SoftmaxNormalization:
         attn.sub_(block_sum_attn.unsqueeze(-1))
         attn_max.sub_(block_sum_attn)
         attn_max = attn_max.amax(0, keepdim=True)
-        return attn.sub_(attn_max.unsqueeze(-1))
+        return attn_max.unsqueeze(-1)
 
     @staticmethod
     def index_reduce(attn, batch_size, block_groups, **rest):
@@ -96,8 +124,7 @@ class SoftmaxNormalization:
         grouped_max = torch.full([batch_size + 1, *attn.shape[1:-1]], -math.inf, dtype=attn.dtype, device=attn.device)
         grouped_max.index_reduce_(0, block_groups, block_max, 'amax')
         grouped_max = grouped_max.index_select(0, block_groups)
-        attn.sub_(grouped_max.unsqueeze(-1))
-        return attn
+        return grouped_max.unsqueeze(-1)
 
     @staticmethod
     def scatter_reduce(attn, batch_size, block_groups, **rest):
@@ -107,8 +134,7 @@ class SoftmaxNormalization:
         indices = block_groups.view(-1, *[1 for _ in grouped_max.shape[1:]]).expand(-1, *grouped_max.shape[1:])
         grouped_max.scatter_reduce_(0, indices, block_max, 'amax')
         grouped_max = grouped_max.index_select(0, block_groups)
-        attn.sub_(grouped_max.unsqueeze(-1))
-        return attn
+        return grouped_max.unsqueeze(-1)
 
 
 normalize = SoftmaxNormalization(os.environ.get('VLLM_PA_SOFTMAX_IMPL', 'wsum_head_amax').split(','))
@@ -122,29 +148,38 @@ def batch2block(tensor, block_mapping):
 def block2batch(tensor, block_mapping):
     shape = tuple(tensor.shape)
     return (block_mapping.t() @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
-
-
-def block_softmax(batch_size, attn, block_mapping, block_scales, block_groups):
-    attn = normalize(batch_size=batch_size, attn=attn, block_mapping=block_mapping, block_scales=block_scales, block_groups=block_groups)
+ 
+def block_softmax(batch_size, attn, block_mapping, block_scales, block_groups, attn_max):
+    ###### WSUM took 1 ms #######
+    norm_var = None
+    if attn_max[-1] is None:
+        norm_var = normalize(batch_size=batch_size, attn=attn, block_mapping=block_mapping, block_scales=block_scales, block_groups=block_groups, attn_max=attn_max)
+    else:
+        norm_var = apply_constant(attn_max[-1], block_mapping=block_mapping)
+    attn.sub_(norm_var)
+    #############################
+    # attn = (n_block, n_kv_h, n_h/n_kv_head, block_size)
     attn = attn.exp_()
     sums = attn.sum(dim=-1).unsqueeze(-1)
-    # block_sum = sums
-    # sums = block2batch(sums, block_mapping)
-    # sums = batch2block(sums, block_mapping)
-    # #sums.add_(torch.finfo(sums.dtype).tiny)
-    # sums = sums.add(torch.finfo(sums.dtype).tiny)
-    # sums = torch.maximum(block_sum, sums)
+    ####### Grouped sum took 1 ms #########
+    block_sum = sums
+    sums = block2batch(sums, block_mapping)
+    sums = batch2block(sums, block_mapping)
+    # sums.add_(torch.finfo(sums.dtype).tiny)
+    sums = torch.maximum(block_sum, sums)
+    ##############################
     attn.div_(sums)
     return attn
 
 
 def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
             block_bias, block_scales, block_groups, scale, matmul_qk_op, matmul_av_op, keys_fetch_func,
-            values_fetch_func):
+            values_fetch_func, attn_max):
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
 
+    ###########   prepare data took 1ms ###########
     query = batch2block(scale * query, block_mapping).unsqueeze(-2)
     key = keys_fetch_func(key_cache, block_list).transpose(1, 2)
     value = values_fetch_func(value_cache, block_list).transpose(1, 2)
@@ -158,9 +193,13 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     else:
         key = key.transpose(2, 3)
 
+    ###########   matmal took 5 ms ###########
     attn = matmul_qk_op(query, key) + block_bias
-    attn = block_softmax(batch_size, attn, block_mapping, block_scales, block_groups)
+    ###########   matmal took 3 ms ###########
+    attn = block_softmax(batch_size, attn, block_mapping, block_scales, block_groups, attn_max)
+    ###########   matmal took 4 ms ###########
     attn = matmul_av_op(attn, value)
+    ##########################################
     attn = block2batch(attn, block_mapping)
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
